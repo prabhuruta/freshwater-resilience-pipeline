@@ -431,28 +431,58 @@ def join_streams(wl_df, sr_df):
 
 # ── 4. CRI COMPUTATION (frozen weights, same formula as CRI_Computation_AllSites.ipynb) ──
 def load_causal_weights(season, site):
+    """
+    Expects columns: site, driver, ensemble_weight, season — this is the
+    exact schema Ensemble_Causal_Weights_Fast.ipynb saves to
+    Global_Ensemble_Causal_Weights_{season}.csv (site_feat dataframe,
+    groupby(['site','driver'])['ensemble_weight']).
+    """
     path = os.path.join(CAUSAL_WEIGHTS_DIR, season, f"Global_Ensemble_Causal_Weights_{season}.csv")
     if not os.path.exists(path):
         print(f"WARNING: no frozen weights for {season} at {path} — using equal weights")
         return {f: 1 / len(FEATURES) for f in FEATURES}
-    wdf = pd.read_csv(path)
-    wdf.columns = wdf.columns.str.lower()
-    site_rows = wdf[wdf["site"].str.lower() == site.lower()]
-    if site_rows.empty:
-        print(f"WARNING: site '{site}' not in frozen weights — using equal weights")
+    try:
+        wdf = pd.read_csv(path)
+        wdf.columns = wdf.columns.str.lower()
+        if not {"site", "driver", "ensemble_weight"}.issubset(wdf.columns):
+            print(f"WARNING: {path} missing expected columns "
+                  f"{{'site','driver','ensemble_weight'}} - {set(wdf.columns)} — using equal weights")
+            return {f: 1 / len(FEATURES) for f in FEATURES}
+        site_rows = wdf[wdf["site"].str.lower() == site.lower()]
+        if site_rows.empty:
+            print(f"WARNING: site '{site}' not in frozen weights — using equal weights")
+            return {f: 1 / len(FEATURES) for f in FEATURES}
+        return dict(zip(site_rows["driver"], site_rows["ensemble_weight"]))
+    except Exception as e:
+        print(f"WARNING: failed to load causal weights ({e}) — using equal weights")
         return {f: 1 / len(FEATURES) for f in FEATURES}
-    return dict(zip(site_rows["driver"], site_rows["weight"]))
 
 
 def load_normalisation_bounds(site):
+    """
+    Expects columns: season, site, feature, site_min, site_max, site_range
+    (this is the exact schema CRI_Computation_AllSites.ipynb saves, and what
+    Normalisation_Bounds_AllSites.csv should have). Returns None on any
+    mismatch rather than raising — a missing/malformed bounds file should
+    degrade to the noisier fallback in compute_cri(), not crash the run.
+    """
     if not os.path.exists(NORMALISATION_BOUNDS_PATH):
         return None
-    bdf = pd.read_csv(NORMALISATION_BOUNDS_PATH)
-    bdf.columns = bdf.columns.str.lower()
-    site_rows = bdf[bdf["site"].str.lower() == site.lower()]
-    if site_rows.empty:
+    try:
+        bdf = pd.read_csv(NORMALISATION_BOUNDS_PATH)
+        bdf.columns = bdf.columns.str.lower()
+        required = {"site", "feature", "site_min", "site_max"}
+        if not required.issubset(bdf.columns):
+            print(f"WARNING: {NORMALISATION_BOUNDS_PATH} is missing expected columns "
+                  f"{required - set(bdf.columns)} — ignoring bounds file for this run.")
+            return None
+        site_rows = bdf[bdf["site"].str.lower() == site.lower()]
+        if site_rows.empty:
+            return None
+        return {row["feature"]: (row["site_min"], row["site_max"]) for _, row in site_rows.iterrows()}
+    except Exception as e:
+        print(f"WARNING: failed to load normalisation bounds ({e}) — ignoring bounds file for this run.")
         return None
-    return {row["feature"]: (row["min"], row["max"]) for _, row in site_rows.iterrows()}
 
 
 def compute_cri(df, season, site):
