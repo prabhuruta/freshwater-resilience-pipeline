@@ -1,0 +1,36 @@
+name: Freshwater CRI Pipeline
+
+# Runs every 30 minutes. Adjust the cron below to match how often your
+# loggers actually write new data — no point running more often than that.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install firebase-admin pandas numpy
+
+      - name: Write service account key from secret
+        run: echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}' > pipeline/serviceAccountKey.json
+
+      - name: Run pipeline
+        working-directory: pipeline
+        env:
+          FIREBASE_KEY_PATH: serviceAccountKey.json
+        run: python firebase_cri_pipeline.py
+
+      - name: Clean up key file
+        if: always()
+        run: rm -f pipeline/serviceAccountKey.json
