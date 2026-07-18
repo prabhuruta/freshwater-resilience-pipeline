@@ -31,15 +31,16 @@ Setup:
   5. Firebase console -> Realtime Database -> Rules -> add:
        {
          "rules": {
-           "sensor_readings": { ".indexOn": ["timestamp"] },
-           "waterLogs":       { ".indexOn": ["time"] },
            "pipeline_state":  { ".read": "auth != null", ".write": "auth != null" },
            "processed_cri":   { ".read": "auth != null", ".write": "auth != null" },
            "results":         { ".read": true, ".write": "auth != null" }
          }
        }
      (results is public-read so the dashboard can fetch it with no credentials;
-     everything else stays private, only this script's service account can touch it.)
+     everything else stays private, only this script's service account can touch it.
+     Note: no .indexOn needed on sensor_readings/waterLogs — pagination now uses
+     Firebase's built-in key ordering, not the record's own timestamp field, so
+     no query index is required on those nodes.)
   6. Add the workflow file (deploy/cri_pipeline.yml in this bundle) to
      `.github/workflows/` in the repo. It runs on a schedule and installs
      `firebase-admin`, `pandas`, `numpy` before invoking this script.
@@ -80,7 +81,7 @@ GitHub Actions is the right starting point.
 import argparse
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -166,12 +167,34 @@ def get_db():
     return db
 
 
-def fetch_new_records(node, since_value, timestamp_field):
-    """Requires `.indexOn": ["<timestamp_field>"]` on this node — see rules in the module docstring."""
+def fetch_new_records(node, since_key):
+    """
+    Pulls records newer than `since_key` using Firebase's PUSH KEY ordering,
+    NOT the record's own timestamp field. This matters because waterLogs.time
+    is stored as "DD-MM-YYYY HH:MM:SS" (day-first) — that format does NOT
+    sort chronologically as a string (e.g. "10-04-2026" < "18-05-2025"
+    alphabetically, despite being a year later), so a query filtered by that
+    field was returning essentially arbitrary results with respect to real
+    time. Push keys are chronologically ordered by Firebase itself regardless
+    of what's inside the record, so ordering/paginating by key sidesteps the
+    problem entirely.
+
+    Returns a dict of {push_key: record}, in chronological order.
+    """
     db = get_db()
     ref = db.reference(node)
-    snapshot = ref.order_by_child(timestamp_field).start_at(since_value).get() or {}
-    return list(snapshot.values())
+    if since_key:
+        # start_at is inclusive, so the previously-seen key comes back too —
+        # the caller drops it before processing.
+        snapshot = ref.order_by_key().start_at(since_key).get() or {}
+    else:
+        # First run ever for this node: no key to start from. Pulling the
+        # entire node once is the correct (if occasionally large) one-time
+        # cost — there is no reliable way to seed "last 24h" from push keys
+        # alone, and seeding from the malformed time field would reintroduce
+        # the exact bug this function exists to avoid.
+        snapshot = ref.order_by_key().get() or {}
+    return snapshot
 
 
 def load_cursor():
@@ -179,11 +202,7 @@ def load_cursor():
     cursor = db.reference(FB_CURSOR_PATH).get()
     if cursor:
         return cursor
-    default_since = datetime.utcnow() - timedelta(hours=24)
-    return {
-        "sensor_readings_since": default_since.strftime("%Y-%m-%d %H:%M:%S"),
-        "waterLogs_since": default_since.strftime("%d-%m-%Y %H:%M:%S"),
-    }
+    return {"waterLogs_last_key": None, "sensor_readings_last_key": None}
 
 
 def save_cursor(cursor):
@@ -521,7 +540,7 @@ def build_dashboard_feed(all_cri_history):
         print("No CRI history yet — nothing to write.")
         return None
 
-    feed = {"generated_at": datetime.utcnow().isoformat(), "criTimeseries": [], "cri_summary_live": []}
+    feed = {"generated_at": datetime.utcnow().isoformat() + "Z", "criTimeseries": [], "cri_summary_live": []}
 
     for (site, season), g in all_cri_history.groupby(["site", "season"]):
         for _, row in g.iterrows():
@@ -542,8 +561,18 @@ def build_dashboard_feed(all_cri_history):
 def run_batch():
     cursor = load_cursor()
 
-    wl_raw = fetch_new_records("waterLogs", cursor["waterLogs_since"], "time")
-    sr_raw = fetch_new_records("sensor_readings", cursor["sensor_readings_since"], "timestamp")
+    wl_snapshot = fetch_new_records("waterLogs", cursor.get("waterLogs_last_key"))
+    sr_snapshot = fetch_new_records("sensor_readings", cursor.get("sensor_readings_last_key"))
+
+    # start_at() is inclusive, so the previously-processed boundary key comes
+    # back again — drop it here so it isn't processed twice.
+    if cursor.get("waterLogs_last_key") in wl_snapshot:
+        wl_snapshot.pop(cursor["waterLogs_last_key"])
+    if cursor.get("sensor_readings_last_key") in sr_snapshot:
+        sr_snapshot.pop(cursor["sensor_readings_last_key"])
+
+    wl_raw = list(wl_snapshot.values())
+    sr_raw = list(sr_snapshot.values())
     print(f"Pulled {len(wl_raw)} waterLogs, {len(sr_raw)} sensor_readings since last run.")
 
     if wl_raw or sr_raw:
@@ -565,10 +594,13 @@ def run_batch():
                 for row in all_audit_rows:
                     print(f"  [{row['site']} / {row['season']}] {row['param']}: {row['note']} (n={row['n']})")
 
-        if wl_raw:
-            cursor["waterLogs_since"] = max(r.get("time", cursor["waterLogs_since"]) for r in wl_raw)
-        if sr_raw:
-            cursor["sensor_readings_since"] = max(r.get("timestamp", cursor["sensor_readings_since"]) for r in sr_raw)
+        # Firebase push keys sort correctly as strings by construction
+        # (chronologically monotonic), so max(keys) is a safe, correct cursor —
+        # unlike max() over the record's own malformed date-string field.
+        if wl_snapshot:
+            cursor["waterLogs_last_key"] = max(wl_snapshot.keys())
+        if sr_snapshot:
+            cursor["sensor_readings_last_key"] = max(sr_snapshot.keys())
         save_cursor(cursor)
     else:
         print("No new data this cycle.")
