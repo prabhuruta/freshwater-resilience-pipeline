@@ -172,6 +172,113 @@ def load_site_registry():
 
 SITE_COORDS = load_site_registry()
 
+# Default match radius given to an auto-registered site. Deliberately generous
+# (covers a moderate GPS spread) since we don't yet know if this is a fixed
+# logger or a boat-surveyed area - can be tightened later by editing the entry
+# once it's understood, same as the manually-curated sites in site_registry.csv.
+AUTO_SITE_RADIUS_KM = 1.0
+
+
+def load_auto_registered_sites():
+    """Sites auto-registered from recurring unmatched GPS clusters, stored in
+    Firebase (not the CSV) since the pipeline writes these itself at runtime."""
+    try:
+        db = get_db()
+        raw = db.reference("auto_registered_sites").get() or {}
+        return {name: (rec["lat"], rec["lon"], rec.get("radius_km", AUTO_SITE_RADIUS_KM))
+                for name, rec in raw.items()}
+    except Exception as e:
+        print(f"WARNING: failed to load auto-registered sites ({e}) — proceeding with CSV registry only.")
+        return {}
+
+
+def reverse_geocode_suggestion(lat, lon):
+    """
+    Suggests a human-readable place name for a GPS point using OpenStreetMap's
+    free Nominatim reverse-geocoding API (no key needed). This is only ever a
+    SUGGESTION for the auto-registered placeholder name — the real confirm/
+    change mechanism stays the site_registry.csv edit (which always takes
+    precedence over anything this function returns), since that's the one
+    write path that doesn't need any new auth/security model on the dashboard.
+
+    Falls back to a coordinate-based name on ANY failure (network issue, rate
+    limit, unexpected response shape) - a naming nicety should never be able
+    to break the pipeline run.
+    """
+    fallback = f"Unnamed-Site_{lat:.4f}_{lon:.4f}"
+    try:
+        import urllib.request
+        url = (f"https://nominatim.openstreetmap.org/reverse?format=json"
+               f"&lat={lat}&lon={lon}&zoom=14&addressdetails=1")
+        req = urllib.request.Request(url, headers={
+            # Nominatim's usage policy requires an identifying User-Agent
+            "User-Agent": "freshwater-resilience-pipeline/1.0 (dissertation research use)"
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        addr = data.get("address", {})
+        # Prefer a water-body name if Nominatim has one mapped at this point,
+        # then fall back to increasingly generic place descriptors.
+        for key in ["water", "lake", "river", "suburb", "neighbourhood", "village",
+                    "town", "city_district", "county", "city"]:
+            if addr.get(key):
+                return f"{addr[key]} (suggested)"
+        display = data.get("display_name", "")
+        if display:
+            return f"{display.split(',')[0]} (suggested)"
+        return fallback
+    except Exception as e:
+        print(f"NOTE: reverse geocoding lookup failed ({e}) — using coordinate-based "
+              f"placeholder name instead. This doesn't affect matching, only the suggested label.")
+        return fallback
+
+
+def auto_register_new_clusters(clusters, existing_coords):
+    """
+    For each cluster of unmatched readings that's far from every already-known
+    site (CSV + previously auto-registered), registers it under a suggested
+    name (reverse-geocoded from its GPS centroid where possible), written to
+    Firebase immediately so matching can start without waiting on a human.
+    The suggested name is clearly labelled as such wherever it's shown -
+    renaming it properly is still just one site_registry.csv row away, and
+    that CSV entry always takes precedence over this placeholder.
+    Only clusters already past UNMATCHED_MIN_CLUSTER_SIZE reach here (set when
+    they were built), so a handful of stray GPS pings can't create a site.
+    Returns the newly registered {name: (lat, lon, radius)} entries.
+    """
+    if not clusters:
+        return {}
+    newly_registered = {}
+    updates = {}
+    for c in clusters:
+        lat, lon = c["centroid_lat"], c["centroid_lon"]
+        already_known = False
+        for _, (elat, elon, eradius) in existing_coords.items():
+            if haversine_km(lat, lon, elat, elon) <= eradius:
+                already_known = True
+                break
+        if already_known:
+            continue
+        suggested_name = reverse_geocode_suggestion(lat, lon)
+        if suggested_name in existing_coords:
+            continue  # already auto-registered in a previous run
+        updates[f"auto_registered_sites/{suggested_name}"] = {
+            "lat": lat, "lon": lon, "radius_km": AUTO_SITE_RADIUS_KM,
+            "auto_registered_at": datetime.utcnow().isoformat() + "Z",
+            "n_readings_at_registration": c["n_readings"],
+            "suggested_csv_row": f"{suggested_name},{lat},{lon},{AUTO_SITE_RADIUS_KM},auto-suggested from GPS - please confirm or rename",
+        }
+        newly_registered[suggested_name] = (lat, lon, AUTO_SITE_RADIUS_KM)
+    if updates:
+        db = get_db()
+        db.reference().update(updates)
+        for name in newly_registered:
+            print(f"AUTO-REGISTERED new site '{name}' from a recurring unmatched GPS cluster. "
+                  f"It will start matching and accumulating data from the NEXT run onward. "
+                  f"Rename it properly any time by adding a matching row to site_registry.csv "
+                  f"with a real name — that takes precedence over this placeholder.")
+    return newly_registered
+
 
 def haversine_km(lat1, lon1, lat2, lon2):
     import math
@@ -183,13 +290,15 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def match_site(lat, lon):
+def match_site(lat, lon, coords=None):
+    if coords is None:
+        coords = SITE_COORDS
     if lat is None or lon is None or (lat == 0 and lon == 0):
         return "UNMATCHED"
-    if not SITE_COORDS:
+    if not coords:
         return "UNMATCHED"
     best_site, best_dist, best_radius = None, float("inf"), None
-    for site, (slat, slon, radius) in SITE_COORDS.items():
+    for site, (slat, slon, radius) in coords.items():
         d = haversine_km(lat, lon, slat, slon)
         if d < best_dist:
             best_site, best_dist, best_radius = site, d, radius
@@ -485,13 +594,13 @@ def process_site_batch(df, site_name, season):
 
 
 # ── 3. LOAD + GPS-MATCH + JOIN THE TWO RAW STREAMS ────────────────────────────
-def load_and_match(wl_raw, sr_raw):
+def load_and_match(wl_raw, sr_raw, coords=None):
     wl_df = pd.DataFrame(wl_raw)
     sr_df = pd.DataFrame(sr_raw)
 
     if not wl_df.empty:
         wl_df = wl_df.rename(columns={"dissolvedO2": "dissolvedo2", "pH": "ph", "tempC": "temp"})
-        wl_df["site"] = wl_df.apply(lambda r: match_site(r.get("lat"), r.get("lon")), axis=1)
+        wl_df["site"] = wl_df.apply(lambda r: match_site(r.get("lat"), r.get("lon"), coords), axis=1)
         wl_df["time_parsed"] = pd.to_datetime(wl_df["time"], format="%d-%m-%Y %H:%M:%S", errors="coerce")
         wl_df["window"] = wl_df["time_parsed"].dt.floor(f"{WINDOW_MINUTES}min")
 
@@ -682,15 +791,39 @@ def compute_cri(df, season, site):
 
 # ── 5. RESULTS FEED ────────────────────────────────────────────────────────────
 def build_dashboard_feed(all_cri_history, unmatched_clusters=None):
+    auto_sites_raw = {}
+    try:
+        db = get_db()
+        auto_sites_raw = db.reference("auto_registered_sites").get() or {}
+    except Exception as e:
+        print(f"WARNING: could not load auto-registered sites for the feed ({e}).")
+
+    auto_registered_summary = [
+        {
+            "name": name,
+            "lat": rec.get("lat"), "lon": rec.get("lon"),
+            "n_readings_at_registration": rec.get("n_readings_at_registration"),
+            "suggested_csv_row": rec.get("suggested_csv_row"),
+        }
+        for name, rec in auto_sites_raw.items()
+    ]
+
     if all_cri_history.empty:
-        print("No CRI history yet — nothing to write.")
-        return None
+        print("No CRI history yet — feed will only include auto-registered site suggestions, if any.")
+        return {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "criTimeseries": [], "cri_summary_live": [],
+            "unmatched_clusters": unmatched_clusters or [],
+            "known_sites": list(SITE_COORDS.keys()),
+            "auto_registered_sites": auto_registered_summary,
+        }
 
     feed = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "criTimeseries": [], "cri_summary_live": [],
         "unmatched_clusters": unmatched_clusters or [],
         "known_sites": list(SITE_COORDS.keys()),
+        "auto_registered_sites": auto_registered_summary,
     }
 
     for (site, season), g in all_cri_history.groupby(["site", "season"]):
@@ -753,6 +886,15 @@ def run_batch():
               f"discarding real data. Commit site_registry.csv to the repo and re-run.")
         return
 
+    # Combine the manually-curated CSV registry with any sites auto-registered
+    # from previous runs' recurring unmatched clusters (see auto_register_new_clusters
+    # at the end of this function) - both are used for matching this run's data.
+    auto_sites = load_auto_registered_sites()
+    effective_coords = {**SITE_COORDS, **auto_sites}
+    if auto_sites:
+        print(f"Loaded {len(auto_sites)} auto-registered site(s) in addition to "
+              f"{len(SITE_COORDS)} from site_registry.csv: {list(auto_sites.keys())}")
+
     cursor = load_cursor()
 
     wl_snapshot = fetch_new_records("waterLogs", cursor.get("waterLogs_last_key"))
@@ -770,7 +912,7 @@ def run_batch():
     print(f"Pulled {len(wl_raw)} waterLogs, {len(sr_raw)} sensor_readings since last run.")
 
     if wl_raw or sr_raw:
-        wl_df, sr_df = load_and_match(wl_raw, sr_raw)
+        wl_df, sr_df = load_and_match(wl_raw, sr_raw, coords=effective_coords)
 
         unmatched_points = extract_unmatched_points(wl_df)
         if unmatched_points:
@@ -811,10 +953,13 @@ def run_batch():
     history = read_processed_cri_from_firebase()
     unmatched_clusters = read_unmatched_log_and_cluster()
     if unmatched_clusters:
-        print(f"NOTE: {len(unmatched_clusters)} candidate new site(s) detected from unmatched GPS "
-              f"readings (each with >= {UNMATCHED_MIN_CLUSTER_SIZE} readings). See the dashboard's "
-              f"'Unregistered GPS Clusters' panel, or /unmatched_gps_log in Firebase, to review and "
-              f"add them to site_registry.csv if they're a real new deployment.")
+        newly_registered = auto_register_new_clusters(unmatched_clusters, effective_coords)
+        if not newly_registered:
+            # Every reported cluster was either already auto-registered in a
+            # prior run, or falls within an existing site's radius - nothing
+            # new to do this cycle.
+            print(f"{len(unmatched_clusters)} unmatched cluster(s) seen, none newly registered "
+                  f"(already registered previously, or within an existing site's radius).")
     feed = build_dashboard_feed(history, unmatched_clusters)
     if feed is not None:
         write_results_to_firebase(feed)
