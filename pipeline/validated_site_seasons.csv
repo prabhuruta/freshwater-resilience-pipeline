@@ -1,0 +1,34 @@
+season,site,cri_mean,cri_std,verdict,n_windows
+premonsoon,S1-Ulhas River,0.4814,0.0298,EARLY WARNING,446
+premonsoon,S2-Kalu River,0.5682,0.0423,STABLE,440
+premonsoon,S3-Ambernath Lake,0.5084,0.0492,STABLE,439
+premonsoon,S4-Bhandup Lake,0.6073,0.0533,EARLY WARNING,438
+premonsoon,S5-Dhamapur Lake,0.4996,0.0406,STABLE,438
+premonsoon,S6-Shirpur Lake,0.5605,0.0524,STABLE,443
+premonsoon,S7-Varawade River,0.4909,0.0367,STABLE,448
+premonsoon,S8-Gotli River,0.5863,0.0515,EARLY WARNING,446
+premonsoon,S9-Karli River,0.4312,0.122,DESTABILISING,452
+premonsoon,S10-Chivla River,0.5015,0.0541,STABLE,446
+premonsoon,S11-Powai Lake,0.5309,0.057,STABLE,446
+monsoon,S1-Ulhas River,0.5922,0.0621,EARLY WARNING,452
+monsoon,S2-Kalu River,0.5223,0.0549,STABLE,440
+monsoon,S3-Ambernath Lake,0.5828,0.0576,STABLE,446
+monsoon,S4-Bhandup Lake,0.6523,0.0698,STABLE,446
+monsoon,S5-Dhamapur Lake,0.6091,0.0532,STABLE,447
+monsoon,S6-Shirpur Lake,0.5638,0.0643,STABLE,397
+monsoon,S7-Varawade River,0.4904,0.0722,DESTABILISING,204
+monsoon,S8-Gotli River,0.597,0.047,DESTABILISING,377
+monsoon,S9-Karli River,0.5136,0.0309,EARLY WARNING,447
+monsoon,S10-Chivla River,0.4652,0.0615,STABLE,442
+monsoon,S11-Powai Lake,0.5701,0.0571,EARLY WARNING,438
+postmonsoon,S1-Ulhas River,0.5598,0.0612,STABLE,446
+postmonsoon,S2-Kalu River,0.5073,0.066,DESTABILISING,446
+postmonsoon,S3-Ambernath Lake,0.4893,0.0632,STABLE,445
+postmonsoon,S4-Bhandup Lake,0.5429,0.0462,EARLY WARNING,448
+postmonsoon,S5-Dhamapur Lake,0.5071,0.0612,STABLE,445
+postmonsoon,S6-Shirpur Lake,0.4539,0.0624,STABLE,445
+postmonsoon,S7-Varawade River,0.4534,0.0533,STABLE,445
+postmonsoon,S8-Gotli River,0.4987,0.0629,EARLY WARNING,392
+postmonsoon,S9-Karli River,0.5133,0.0758,STABLE,206
+postmonsoon,S10-Chivla River,0.4975,0.0707,EARLY WARNING,445
+postmonsoon,S11-Powai Lake,0.533,0.0602,STABLE,446

@@ -1,0 +1,12 @@
+site,lat,lon,match_radius_km,notes
+S1-Ulhas River,19.2542,73.221363,0.3,fixed logger deployment
+S2-Kalu River,19.304704,73.241197,0.3,fixed logger deployment
+S3-Ambernath Lake,19.182509,73.192435,0.3,fixed logger deployment
+S4-Bhandup Lake,19.14652,72.930468,0.3,fixed logger deployment
+S5-Dhamapur Lake,16.035893,73.590129,1.8,boat-surveyed across wider lake area
+S6-Shirpur Lake,21.068528,74.859325,0.3,fixed logger deployment
+S7-Varawade River,16.152213,73.403326,0.3,fixed logger deployment
+S8-Gotli River,16.14326,73.37373,0.3,fixed logger deployment
+S9-Karli River,16.020966,73.630686,8.0,"wide river survey; GPS-fault (0,0) rows excluded from centroid"
+S10-Chivla River,16.04156,73.28391,0.3,fixed logger deployment
+S11-Powai Lake,19.122641,72.911688,3.0,boat-surveyed across wider lake area
