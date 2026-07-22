@@ -542,7 +542,7 @@ def read_unmatched_log_and_cluster():
     return cluster_unmatched_points(points)
 
 
-
+def join_streams(wl_df, sr_df):
     if wl_df.empty:
         return pd.DataFrame()
 
