@@ -23,6 +23,13 @@ Setup:
      every run, only when you recompute them offline in Colab):
        pipeline/SEASONAL_CAUSAL_WEIGHTS_FAST/{season}/Global_Ensemble_Causal_Weights_{season}.csv
        pipeline/Normalisation_Bounds_AllSites.csv
+       pipeline/site_registry.csv   <- known sites (site,lat,lon,match_radius_km,notes).
+                                        TO ADD A FUTURE SITE: add one row to this file and
+                                        push. No code changes needed. See the "Unregistered
+                                        GPS Clusters" panel on the dashboard (or
+                                        /unmatched_gps_log in Firebase) to find candidate new
+                                        sites before naming them - a recurring cluster of
+                                        unmatched readings is a real deployment worth adding.
   3. Firebase console -> Project settings -> Service accounts -> Generate new
      private key. Copy the ENTIRE JSON contents.
   4. GitHub repo -> Settings -> Secrets and variables -> Actions -> New repository
@@ -31,9 +38,10 @@ Setup:
   5. Firebase console -> Realtime Database -> Rules -> add:
        {
          "rules": {
-           "pipeline_state":  { ".read": "auth != null", ".write": "auth != null" },
-           "processed_cri":   { ".read": "auth != null", ".write": "auth != null" },
-           "results":         { ".read": true, ".write": "auth != null" }
+           "pipeline_state":   { ".read": "auth != null", ".write": "auth != null" },
+           "processed_cri":    { ".read": "auth != null", ".write": "auth != null" },
+           "unmatched_gps_log":{ ".read": "auth != null", ".write": "auth != null" },
+           "results":          { ".read": true, ".write": "auth != null" }
          }
        }
      (results is public-read so the dashboard can fetch it with no credentials;
@@ -80,11 +88,13 @@ GitHub Actions is the right starting point.
 
 import argparse
 import json
+import math
 import os
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
+from scipy.stats import kendalltau
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 FIREBASE_DB_URL = "https://mywaterproject-e6489-default-rtdb.asia-southeast1.firebasedatabase.app/"
@@ -92,9 +102,35 @@ SERVICE_ACCOUNT_KEY_PATH = os.environ.get("FIREBASE_KEY_PATH", "serviceAccountKe
 
 CAUSAL_WEIGHTS_DIR = os.path.join(os.path.dirname(__file__), "SEASONAL_CAUSAL_WEIGHTS_FAST")
 NORMALISATION_BOUNDS_PATH = os.path.join(os.path.dirname(__file__), "Normalisation_Bounds_AllSites.csv")
+# Condensed export of the validated CWM_CSD_Results_v2.csv (season, site, cri_mean,
+# cri_std, verdict, n_windows) — the reference this script checks against to answer
+# "has this site/season been through the full dissertation analysis before?"
+VALIDATED_SITE_SEASONS_PATH = os.path.join(os.path.dirname(__file__), "validated_site_seasons.csv")
 
 FEATURES = ["dissolvedo2", "orp", "ph", "tds", "temp", "turbidity", "bga", "chlorophyll"]
 WINDOW_MINUTES = 5
+
+# Minimum accumulated windows before a site-season is considered ready for a
+# REAL CWM-CSD recompute (PE + DFA + RQA, not a shortcut). This mirrors what
+# the dissertation's own methodology required: RQA needs >=120 windows for its
+# rolling recurrence calculation, and the per-season DFA alpha in the original
+# study was computed on 204-452 windows per site-season. 250 is a conservative
+# floor sitting inside that established range - not a new number invented for
+# the live pipeline.
+MIN_WINDOWS_FOR_FULL_RECOMPUTE = 250
+
+# Exact CWM-CSD parameters, ported unchanged from CWM_CSD_v2.ipynb (Cell 4 config),
+# so a full recompute here matches the original dissertation methodology precisely.
+PE_M = 4          # permutation entropy embedding dimension
+PE_TAU = 1        # permutation entropy lag
+DFA_SCALES = [8, 12, 16, 24, 32, 48, 64, 96, 128]
+RQA_M = 3
+RQA_TAU = 1
+RQA_EPS = 0.20    # fraction of std
+ROLLING_W = 60    # PE rolling window (5 hrs at 5-min resolution)
+RQA_WIN = 120     # RQA window (10 hrs) - FIX 1 from the original notebook
+EARLY_WARNING_THRESH = 1   # >=1 method triggers EARLY WARNING
+DESTABILISING_THRESH = 2   # >=2 methods triggers DESTABILISING
 
 # Firebase paths used for STATE (must survive between ephemeral runner instances)
 FB_CURSOR_PATH = "pipeline_state/cursor"
@@ -102,23 +138,39 @@ FB_PROCESSED_CRI_PATH = "processed_cri"     # {site}/{season}/{window_key} -> {c
 FB_RESULTS_PATH = "results/dashboard_feed"  # public-read, what the dashboard fetches
 
 
-# ── SITE MATCHING (GPS-based) ──────────────────────────────────────────────────
-# True centroids from raw Premonsoon_Final.xlsx, GPS-fault (0,0) rows excluded.
-# 9 of 11 sites are near-fixed logger deployments (radius ~0-0.1km); S5, S9, S11
-# were boat-surveyed across wider areas, so each site gets its own match radius.
-SITE_COORDS = {
-    "S1-Ulhas River":     (19.2542,    73.221363, 0.3),
-    "S2-Kalu River":      (19.304704,  73.241197, 0.3),
-    "S3-Ambernath Lake":  (19.182509,  73.192435, 0.3),
-    "S4-Bhandup Lake":    (19.14652,   72.930468, 0.3),
-    "S5-Dhamapur Lake":   (16.035893,  73.590129, 1.8),
-    "S6-Shirpur Lake":    (21.068528,  74.859325, 0.3),
-    "S7-Varawade River":  (16.152213,  73.403326, 0.3),
-    "S8-Gotli River":     (16.14326,   73.37373,  0.3),
-    "S9-Karli River":     (16.020966,  73.630686, 8.0),
-    "S10-Chivla River":   (16.04156,   73.28391,  0.3),
-    "S11-Powai Lake":     (19.122641,  72.911688, 3.0),
-}
+# ── SITE MATCHING (GPS-based, loaded from an editable registry file) ──────────
+# Site coordinates now live in site_registry.csv, NOT hardcoded here — this is
+# the mechanism for adding a future/unknown site: add one row to that CSV
+# (site, lat, lon, match_radius_km, notes) and push it, no code changes needed.
+#
+# 9 of the original 11 sites are near-fixed logger deployments (radius ~0.3km);
+# a few were boat-surveyed across wider areas and carry a larger radius — set
+# whatever radius fits how that site was/will be surveyed.
+SITE_REGISTRY_PATH = os.path.join(os.path.dirname(__file__), "site_registry.csv")
+
+# How close together repeated UNMATCHED readings need to be (km) to count as
+# the same candidate new site, when clustering for the discovery report below.
+UNMATCHED_CLUSTER_RADIUS_KM = 1.0
+# Minimum number of readings at a cluster before it's worth surfacing as a
+# candidate new site (filters out one-off GPS glitches / passing-through pings).
+UNMATCHED_MIN_CLUSTER_SIZE = 5
+
+
+def load_site_registry():
+    """
+    Returns {site_name: (lat, lon, radius_km)}. Falls back to an empty registry
+    (everything becomes UNMATCHED) with a clear warning if the file is missing,
+    rather than crashing — a missing registry shouldn't take down the batch job.
+    """
+    if not os.path.exists(SITE_REGISTRY_PATH):
+        print(f"WARNING: {SITE_REGISTRY_PATH} not found — no known sites loaded, "
+              f"everything will be UNMATCHED. Add the file (site,lat,lon,match_radius_km,notes) to fix.")
+        return {}
+    reg = pd.read_csv(SITE_REGISTRY_PATH)
+    return {row["site"]: (row["lat"], row["lon"], row["match_radius_km"]) for _, row in reg.iterrows()}
+
+
+SITE_COORDS = load_site_registry()
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -134,12 +186,44 @@ def haversine_km(lat1, lon1, lat2, lon2):
 def match_site(lat, lon):
     if lat is None or lon is None or (lat == 0 and lon == 0):
         return "UNMATCHED"
+    if not SITE_COORDS:
+        return "UNMATCHED"
     best_site, best_dist, best_radius = None, float("inf"), None
     for site, (slat, slon, radius) in SITE_COORDS.items():
         d = haversine_km(lat, lon, slat, slon)
         if d < best_dist:
             best_site, best_dist, best_radius = site, d, radius
     return best_site if best_dist <= best_radius else "UNMATCHED"
+
+
+def cluster_unmatched_points(points, radius_km=UNMATCHED_CLUSTER_RADIUS_KM):
+    """
+    Simple greedy clustering of (lat, lon) points that didn't match any known
+    site — groups points within radius_km of each other so that a real,
+    recurring new deployment location shows up as ONE candidate with a count,
+    not dozens of individual unmatched pings. Not a rigorous clustering
+    algorithm (no need for one at this scale) - just nearest-existing-cluster-
+    centroid assignment, which is sufficient for a discovery/review report.
+    """
+    clusters = []  # each: {'lat_sum', 'lon_sum', 'n', 'points': [...]}
+    for lat, lon in points:
+        placed = False
+        for c in clusters:
+            c_lat, c_lon = c["lat_sum"] / c["n"], c["lon_sum"] / c["n"]
+            if haversine_km(lat, lon, c_lat, c_lon) <= radius_km:
+                c["lat_sum"] += lat
+                c["lon_sum"] += lon
+                c["n"] += 1
+                placed = True
+                break
+        if not placed:
+            clusters.append({"lat_sum": lat, "lon_sum": lon, "n": 1})
+    return [
+        {"centroid_lat": round(c["lat_sum"] / c["n"], 6),
+         "centroid_lon": round(c["lon_sum"] / c["n"], 6),
+         "n_readings": c["n"]}
+        for c in clusters if c["n"] >= UNMATCHED_MIN_CLUSTER_SIZE
+    ]
 
 
 def infer_season(dt):
@@ -421,7 +505,44 @@ def load_and_match(wl_raw, sr_raw):
     return wl_df, sr_df
 
 
-def join_streams(wl_df, sr_df):
+def extract_unmatched_points(wl_df):
+    """Pulls (lat, lon) for every row that didn't match a known site, for logging/clustering."""
+    if wl_df.empty or "site" not in wl_df.columns:
+        return []
+    unmatched = wl_df[(wl_df["site"] == "UNMATCHED") & (wl_df["lat"] != 0) & (wl_df["lon"] != 0)]
+    return list(zip(unmatched["lat"], unmatched["lon"]))
+
+
+def log_unmatched_points_to_firebase(points):
+    """
+    Appends unmatched GPS points to a Firebase log so they can be reviewed later —
+    without this, an unmatched reading is just silently dropped and a real new
+    deployment location could go unnoticed for a long time.
+    """
+    if not points:
+        return
+    db = get_db()
+    updates = {}
+    now_key = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    for i, (lat, lon) in enumerate(points):
+        updates[f"unmatched_gps_log/{now_key}_{i}"] = {"lat": lat, "lon": lon}
+    db.reference().update(updates)
+
+
+def read_unmatched_log_and_cluster():
+    """
+    Pulls the full unmatched-GPS log back out and clusters it into candidate new
+    sites. This is what powers the dashboard's "Unregistered GPS Clusters" panel —
+    a recurring cluster of unmatched readings is a strong signal a new site
+    should be added to site_registry.csv.
+    """
+    db = get_db()
+    raw = db.reference("unmatched_gps_log").get() or {}
+    points = [(rec["lat"], rec["lon"]) for rec in raw.values() if "lat" in rec and "lon" in rec]
+    return cluster_unmatched_points(points)
+
+
+
     if wl_df.empty:
         return pd.DataFrame()
 
@@ -475,6 +596,31 @@ def load_causal_weights(season, site):
     except Exception as e:
         print(f"WARNING: failed to load causal weights ({e}) — using equal weights")
         return {f: 1 / len(FEATURES) for f in FEATURES}
+
+
+def load_validated_baseline(season, site):
+    """
+    Checks whether this (site, season) went through the full dissertation
+    analysis (CWM_CSD_Results_v2.csv). Returns a dict with the historical
+    cri_mean/cri_std/verdict/n_windows if found, or None if this is genuinely
+    new territory — a site or season combination never analysed before.
+    """
+    if not os.path.exists(VALIDATED_SITE_SEASONS_PATH):
+        return None
+    try:
+        vdf = pd.read_csv(VALIDATED_SITE_SEASONS_PATH)
+        vdf.columns = vdf.columns.str.lower()
+        match = vdf[(vdf["site"].str.lower() == site.lower()) & (vdf["season"].str.lower() == season.lower())]
+        if match.empty:
+            return None
+        row = match.iloc[0]
+        return {
+            "cri_mean": float(row["cri_mean"]), "cri_std": float(row["cri_std"]),
+            "verdict": row["verdict"], "n_windows": int(row["n_windows"]),
+        }
+    except Exception as e:
+        print(f"WARNING: failed to load validated baseline ({e}) — treating as no past record.")
+        return None
 
 
 def load_normalisation_bounds(site):
@@ -535,25 +681,61 @@ def compute_cri(df, season, site):
 
 
 # ── 5. RESULTS FEED ────────────────────────────────────────────────────────────
-def build_dashboard_feed(all_cri_history):
+def build_dashboard_feed(all_cri_history, unmatched_clusters=None):
     if all_cri_history.empty:
         print("No CRI history yet — nothing to write.")
         return None
 
-    feed = {"generated_at": datetime.utcnow().isoformat() + "Z", "criTimeseries": [], "cri_summary_live": []}
+    feed = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "criTimeseries": [], "cri_summary_live": [],
+        "unmatched_clusters": unmatched_clusters or [],
+        "known_sites": list(SITE_COORDS.keys()),
+    }
 
     for (site, season), g in all_cri_history.groupby(["site", "season"]):
         for _, row in g.iterrows():
             feed["criTimeseries"].append({"season": season, "site": site, "t": row["t"], "cri": row["cri"]})
         cri_vals = g["cri"].dropna()
         if len(cri_vals):
-            feed["cri_summary_live"].append({
+            live_mean = round(float(cri_vals.mean()), 4)
+            live_std_raw = cri_vals.std()
+            live_std = round(float(live_std_raw), 4) if pd.notna(live_std_raw) else None
+            n_windows = int(len(cri_vals))
+
+            baseline = load_validated_baseline(season, site)
+            entry = {
                 "site": site, "season": season,
-                "cri_mean": round(float(cri_vals.mean()), 4),
-                "cri_std": round(float(cri_vals.std()), 4),
-                "n_windows": int(len(cri_vals)),
+                "cri_mean": live_mean, "cri_std": live_std,
+                "n_windows": n_windows,
                 "last_updated": str(g["t"].max()),
-            })
+                # Data-sufficiency check against the SAME thresholds the real
+                # methodology already requires (RQA_WIN=120, DFA per-season used
+                # 204-452 windows in the dissertation) - not a new metric, just
+                # reporting readiness against established requirements.
+                "ready_for_full_recompute": n_windows >= MIN_WINDOWS_FOR_FULL_RECOMPUTE,
+                "windows_needed": MIN_WINDOWS_FOR_FULL_RECOMPUTE,
+            }
+
+            if baseline is not None:
+                # A real prior record exists from the dissertation analysis -
+                # shown as-is as reference context. This is the actual, fully
+                # computed CWM-CSD verdict (PE + DFA + RQA), not a shortcut.
+                entry["has_historical_baseline"] = True
+                entry["baseline_cri_mean"] = baseline["cri_mean"]
+                entry["baseline_verdict"] = baseline["verdict"]
+                entry["baseline_n_windows"] = baseline["n_windows"]
+            else:
+                # No past record for this exact (site, season) combination —
+                # could be a brand-new site, or a known site reporting in a
+                # season it's never been analysed for before. No verdict is
+                # fabricated here; a real one only appears once
+                # recompute_cwm_csd() has run PE/DFA/RQA on enough accumulated
+                # data (see that function below).
+                entry["has_historical_baseline"] = False
+                entry["baseline_note"] = "No past records found for this site/season."
+
+            feed["cri_summary_live"].append(entry)
     return feed
 
 
@@ -577,6 +759,13 @@ def run_batch():
 
     if wl_raw or sr_raw:
         wl_df, sr_df = load_and_match(wl_raw, sr_raw)
+
+        unmatched_points = extract_unmatched_points(wl_df)
+        if unmatched_points:
+            log_unmatched_points_to_firebase(unmatched_points)
+            print(f"Logged {len(unmatched_points)} unmatched GPS points to /unmatched_gps_log "
+                  f"for future site-discovery review.")
+
         joined = join_streams(wl_df, sr_df)
 
         if not joined.empty:
@@ -608,26 +797,248 @@ def run_batch():
     # Always rebuild + push the feed, even on a no-new-data cycle, so
     # `generated_at` reflects that the job is alive and running.
     history = read_processed_cri_from_firebase()
-    feed = build_dashboard_feed(history)
+    unmatched_clusters = read_unmatched_log_and_cluster()
+    if unmatched_clusters:
+        print(f"NOTE: {len(unmatched_clusters)} candidate new site(s) detected from unmatched GPS "
+              f"readings (each with >= {UNMATCHED_MIN_CLUSTER_SIZE} readings). See the dashboard's "
+              f"'Unregistered GPS Clusters' panel, or /unmatched_gps_log in Firebase, to review and "
+              f"add them to site_registry.csv if they're a real new deployment.")
+    feed = build_dashboard_feed(history, unmatched_clusters)
     if feed is not None:
         write_results_to_firebase(feed)
         print(f"Pushed results feed: {len(feed['criTimeseries'])} points, "
-              f"{len(feed['cri_summary_live'])} site-season summaries.")
+              f"{len(feed['cri_summary_live'])} site-season summaries, "
+              f"{len(unmatched_clusters)} unmatched clusters.")
     print("Done.")
+
+
+def permutation_entropy(x, m=PE_M, tau=PE_TAU, normalise=True):
+    """Ported unchanged from CWM_CSD_v2.ipynb."""
+    x = np.array(x, dtype=float)
+    if len(x) < m * tau + 1:
+        return np.nan
+    N = len(x) - (m - 1) * tau
+    counts = {}
+    for i in range(N):
+        sub = x[i: i + m * tau: tau]
+        perm = tuple(np.argsort(sub))
+        counts[perm] = counts.get(perm, 0) + 1
+    probs = np.array(list(counts.values())) / N
+    pe = -np.sum(probs * np.log(probs + 1e-12))
+    if normalise:
+        pe = pe / np.log(math.factorial(m))
+    return round(pe, 6)
+
+
+def rolling_pe(x, m=PE_M, tau=PE_TAU, window=ROLLING_W):
+    x, n = np.array(x, dtype=float), len(x)
+    out = np.full(n, np.nan)
+    for i in range(window, n):
+        out[i] = permutation_entropy(x[i - window:i], m, tau)
+    return out
+
+
+def cwm_pe(pe_series, cdr):
+    """CWM-PE = (1-PE) x CDR — rising = increasing regularity = CSD."""
+    return (1 - pe_series) * cdr
+
+
+def dfa(x, scales=DFA_SCALES):
+    """DFA scaling exponent alpha. alpha>0.5 = persistent = CSD building. Ported unchanged."""
+    x = np.array(x, dtype=float)
+    x = x - x.mean()
+    y = np.cumsum(x)
+    n = len(y)
+    F_vals, valid_scales = [], []
+    for s in scales:
+        if s < 4 or s > n // 2:
+            continue
+        n_boxes = n // s
+        if n_boxes < 2:
+            continue
+        rms = []
+        for b in range(n_boxes):
+            seg = y[b * s:(b + 1) * s]
+            t = np.arange(len(seg))
+            coef = np.polyfit(t, seg, 1)
+            rms.append(np.sqrt(np.mean((seg - np.polyval(coef, t)) ** 2)))
+        F_vals.append(np.mean(rms))
+        valid_scales.append(s)
+    if len(valid_scales) < 4:
+        return np.nan
+    alpha, _ = np.polyfit(np.log(valid_scales), np.log(F_vals), 1)
+    return round(alpha, 6)
+
+
+def build_recurrence_matrix(x, m=RQA_M, tau=RQA_TAU, eps=None):
+    x = np.array(x, dtype=float)
+    N = len(x) - (m - 1) * tau
+    emb = np.array([x[i:i + (m - 1) * tau + 1:tau] for i in range(N)])
+    D = np.sqrt(((emb[:, None, :] - emb[None, :, :]) ** 2).sum(axis=2))
+    if eps is None:
+        eps = RQA_EPS * x.std()
+    return (D <= eps).astype(np.uint8)
+
+
+def rqa_measures(R):
+    N = R.shape[0]
+    np.fill_diagonal(R, 0)
+    total_rp = R.sum()
+    if total_rp == 0:
+        return 0.0, 0.0, 0.0
+    det_rp = 0
+    for d in range(1, N):
+        diag = np.diag(R, d)
+        L, inL = 0, False
+        for v in diag:
+            if v: inL, L = True, L + 1
+            elif inL:
+                if L >= 2: det_rp += L
+                inL, L = False, 0
+        if inL and L >= 2: det_rp += L
+    lam_rp, tt_lens = 0, []
+    for col in range(N):
+        L, inL = 0, False
+        for v in R[:, col]:
+            if v: inL, L = True, L + 1
+            elif inL:
+                if L >= 2: lam_rp += L; tt_lens.append(L)
+                inL, L = False, 0
+        if inL and L >= 2: lam_rp += L; tt_lens.append(L)
+    det = det_rp / total_rp if total_rp > 0 else 0.0
+    lam = lam_rp / total_rp if total_rp > 0 else 0.0
+    tt = np.mean(tt_lens) if tt_lens else 0.0
+    return round(det, 6), round(lam, 6), round(tt, 6)
+
+
+def rolling_rqa(x, m=RQA_M, tau=RQA_TAU, eps_frac=RQA_EPS, window=RQA_WIN, cdr=1.5):
+    x = np.array(x, dtype=float)
+    n = len(x)
+    eps = eps_frac * x.std() * (1 / cdr)
+    det_out = np.full(n, np.nan)
+    lam_out = np.full(n, np.nan)
+    for i in range(window, n):
+        seg = x[i - window:i]
+        try:
+            R = build_recurrence_matrix(seg, m, tau, eps)
+            d, l, t = rqa_measures(R)
+            det_out[i] = d
+            lam_out[i] = l
+        except Exception:
+            pass
+    return det_out, lam_out
+
+
+def kendall_trend(series):
+    s = np.array(series, dtype=float)
+    idx = np.where(~np.isnan(s))[0]
+    if len(idx) < 10:
+        return np.nan, np.nan
+    tau, p = kendalltau(idx, s[idx])
+    return round(tau, 4), round(p, 4)
+
+
+def compute_cdr(weights_dict):
+    """Same definition used everywhere else in this pipeline: top weight / mean of the rest."""
+    vals = sorted(weights_dict.values(), reverse=True)
+    if len(vals) < 2:
+        return 1.0
+    top = vals[0]
+    rest_mean = np.mean(vals[1:]) if np.mean(vals[1:]) > 1e-9 else 1e-9
+    return round(top / rest_mean, 4)
+
+
+def run_full_cwm_csd(x, cdr):
+    """
+    Runs the actual, unmodified CWM-CSD verdict logic (PE + DFA + RQA + majority
+    vote) on a CRI series, given that site-season's CDR. This is the same
+    computation as CWM_CSD_v2.ipynb, not an approximation - only called once a
+    site-season has both enough windows (MIN_WINDOWS_FOR_FULL_RECOMPUTE) and a
+    real CDR from actual causal weights (not equal-weight fallback).
+    """
+    pe_series = rolling_pe(x)
+    cwmpe_series = cwm_pe(pe_series, cdr)
+    tau_cwmpe, p_cwmpe = kendall_trend(cwmpe_series)
+    csd_pe = bool(not np.isnan(tau_cwmpe) and tau_cwmpe > 0 and p_cwmpe < 0.05)
+
+    alpha = dfa(x)
+    csd_dfa = bool(not np.isnan(alpha) and alpha > 0.65)
+
+    det_series, lam_series = rolling_rqa(x, cdr=cdr)
+    tau_det, p_det = kendall_trend(det_series)
+    tau_lam, p_lam = kendall_trend(lam_series)
+    csd_rqa = bool((not np.isnan(tau_det) and tau_det > 0 and p_det < 0.05) or
+                    (not np.isnan(tau_lam) and tau_lam > 0 and p_lam < 0.05))
+
+    n_agree = int(csd_pe) + int(csd_dfa) + int(csd_rqa)
+    if n_agree >= DESTABILISING_THRESH:
+        verdict = "DESTABILISING"
+    elif n_agree >= EARLY_WARNING_THRESH:
+        verdict = "EARLY WARNING"
+    else:
+        verdict = "STABLE"
+
+    return {
+        "tau_cwmpe": tau_cwmpe, "p_cwmpe": p_cwmpe, "csd_pe": csd_pe,
+        "dfa_alpha": alpha, "csd_dfa": csd_dfa,
+        "tau_det": tau_det, "p_det": p_det, "tau_lam": tau_lam, "p_lam": p_lam, "csd_rqa": csd_rqa,
+        "n_methods": n_agree, "verdict": verdict,
+    }
 
 
 def recompute_cwm_csd():
     """
-    Once /processed_cri has enough windows per site (RQA needs >=120, DFA
-    wants >=500-1000+), lift permutation_entropy / dfa / build_recurrence_matrix
-    / rqa_measures / kendall_trend from CWM_CSD_v2.ipynb unchanged, point them
-    at read_processed_cri_from_firebase() instead of the static CRI_Windowwise
-    CSVs, and write the updated 3-tier verdict alongside the CRI feed.
-    Run this daily/weekly (a separate, less frequent GitHub Actions schedule),
-    not every batch tick.
+    Runs the REAL CWM-CSD recompute (not a shortcut) for every site-season in
+    /processed_cri that is actually ready for it. "Ready" means both:
+      1. Enough accumulated windows (>= MIN_WINDOWS_FOR_FULL_RECOMPUTE, itself
+         set from the same RQA/DFA data requirements the dissertation used).
+      2. Real causal weights available for that site (from Ensemble Causal
+         Weights) - NOT the equal-weight fallback, since CDR is meaningless
+         without genuine causal discovery behind it.
+    A site-season missing either precondition is reported as not-yet-ready,
+    with a clear reason, rather than silently skipped or approximated.
+    Run this on a separate, slower schedule (daily/weekly) - not every batch
+    tick, since DFA/RQA are computationally heavier than the CRI step.
     """
-    print("recompute_cwm_csd(): plug in CWM_CSD_v2.ipynb's PE/DFA/RQA functions here, "
-          "reading from read_processed_cri_from_firebase().")
+    history = read_processed_cri_from_firebase()
+    if history.empty:
+        print("No processed CRI history yet — nothing to recompute.")
+        return
+
+    results = {}
+    for (site, season), g in history.groupby(["site", "season"]):
+        g = g.sort_values("t")
+        x = g["cri"].dropna().values
+        n_windows = len(x)
+
+        if n_windows < MIN_WINDOWS_FOR_FULL_RECOMPUTE:
+            print(f"  [{site} / {season}] NOT READY — {n_windows}/{MIN_WINDOWS_FOR_FULL_RECOMPUTE} "
+                  f"windows collected. Waiting for more data.")
+            continue
+
+        weights = load_causal_weights(season, site)
+        is_equal_weight_fallback = len(set(round(w, 6) for w in weights.values())) <= 1
+        if is_equal_weight_fallback:
+            print(f"  [{site} / {season}] NOT READY — {n_windows} windows collected (sufficient), "
+                  f"but no real causal weights found for this site (Ensemble Causal Weights "
+                  f"hasn't been run for it yet). Run that offline first, then this will proceed.")
+            continue
+
+        cdr = compute_cdr(weights)
+        verdict_data = run_full_cwm_csd(x, cdr)
+        verdict_data.update({"site": site, "season": season, "cdr": cdr, "n_windows": n_windows,
+                              "computed_at": datetime.utcnow().isoformat() + "Z"})
+        results[f"{site}|{season}"] = verdict_data
+        print(f"  [{site} / {season}] RECOMPUTED — verdict={verdict_data['verdict']} "
+              f"(n_methods={verdict_data['n_methods']}/3, n_windows={n_windows})")
+
+    if results:
+        db = get_db()
+        updates = {f"results/live_verdicts/{k.replace('|', '/')}": v for k, v in results.items()}
+        db.reference().update(updates)
+        print(f"Wrote {len(results)} real recomputed verdict(s) to /results/live_verdicts")
+    else:
+        print("No site-seasons were ready for a full recompute this run.")
 
 
 if __name__ == "__main__":
