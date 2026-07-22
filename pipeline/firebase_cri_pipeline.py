@@ -741,6 +741,18 @@ def build_dashboard_feed(all_cri_history, unmatched_clusters=None):
 
 # ── 6. MAIN ────────────────────────────────────────────────────────────────────
 def run_batch():
+    if not SITE_COORDS:
+        # The site registry failed to load - every reading would be marked
+        # UNMATCHED and silently discarded if we proceeded. Stop here WITHOUT
+        # touching the cursor, so once site_registry.csv is actually present,
+        # the next run re-fetches this exact same data instead of having
+        # silently lost it (which is what happened before this guard existed:
+        # the cursor advanced past a whole batch that got discarded).
+        print(f"FATAL: site_registry.csv not found or empty at {SITE_REGISTRY_PATH} — "
+              f"refusing to process or advance the cursor this run, to avoid silently "
+              f"discarding real data. Commit site_registry.csv to the repo and re-run.")
+        return
+
     cursor = load_cursor()
 
     wl_snapshot = fetch_new_records("waterLogs", cursor.get("waterLogs_last_key"))
