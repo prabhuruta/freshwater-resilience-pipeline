@@ -20,7 +20,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install firebase-admin pandas numpy
+        run: pip install firebase-admin pandas numpy scipy
 
       - name: Write service account key from secret
         run: echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}' > pipeline/serviceAccountKey.json
